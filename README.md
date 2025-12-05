@@ -6,6 +6,7 @@ The main motivating application is a novel subcellular proteome dataset from the
 
 NOTE: The Thalassiosira pseudonana(Thaps2024) experimental dataset analyzed in this package is not publicly available at this time. The data will be made available upon journal publication. In the meantime, researchers who wish to access the data may contact Loay J. Jabre(ljabre@mta.ca).
 
+This rest of this document provides a brief introduction to the package. A detailed tutorial is available at [intro](https://github.com/ZiyueZHENG/FSPmix/blob/main/intro.html), and the code used for the experiments in the paper can be found in [inst/Paper_code](https://github.com/ZiyueZHENG/FSPmix/blob/main/inst/Paper_code.pdf).
 
 ## Installation
 The R package can be installed using the following commands.
