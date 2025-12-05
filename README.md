@@ -4,7 +4,7 @@ This package implements a semi-supervised functional clustering model for spatia
 
 The main motivating application is a novel subcellular proteome dataset from the model diatom Thalassiosira pseudonana(CCMP1335) using differential centrifugation.
 
-NOTE: The Thalassiosira pseudonana(CCMP1335) experimental dataset analyzed in this package is not publicly available at this time. The data will be made available upon journal publication. In the meantime, researchers who wish to access the data may contact Loay J. Jabre(ljabre@mta.ca).
+NOTE: The Thalassiosira pseudonana(Thaps2024) experimental dataset analyzed in this package is not publicly available at this time. The data will be made available upon journal publication. In the meantime, researchers who wish to access the data may contact Loay J. Jabre(ljabre@mta.ca).
 
 
 ## Installation
@@ -14,7 +14,7 @@ devtools::install_github("ZiyueZHENG/FSPmix", subdir = "FSPmix")
 library(FSPmix)
 </pre>
 
-## Vignette
+## Use FSPmix for a spatial proteomics dataset
 ### Step 0 Preparing data
 This method is designed for data collecting from mass spectorometer. 
 The data should be a *n\*(p+1)* dataframe with *n* proteins and *p* fractions and the last column is label. Unlabel data should marked as NA in the last column. 
@@ -26,10 +26,11 @@ The data should be a *n\*(p+1)* dataframe with *n* proteins and *p* fractions an
   <!-- more rows -->
 </table>
 With this dataframe, you can use *prepare_data* to process the data. And this function will give a list with $data and $labels two attributes which are the direct inputs of main function.
-<pre lang="markdown">x <- prepare_data(Loay2024)
+<pre lang="markdown">x <- prepare_data(Thaps2024)
 data <- x$data
 label <- x$labels</pre>
 There are several built-in datasets in this package. You can check and refer to their data type:
+
 * yeast2018
 * hirst2018
 * moloneyTbBSF
