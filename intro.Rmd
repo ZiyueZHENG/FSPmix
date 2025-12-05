@@ -1,0 +1,152 @@
+---
+title: "FSPMix"
+author: "Ziyue Zheng"
+date: "2025-09-05"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+    math: katex
+    toc: true  
+    toc_depth: 3
+---
+
+```{css, echo=FALSE}
+.main-content {
+  max-width: 1200px;
+}
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Install and load the package
+
+**The package is built with litr**
+
+This package is built with litr. Everything is edited in the create-FSPmix.Rmd file. Then you just need the followwing line to deploy it.
+```{r, eval=FALSE}
+library(devtools)
+devtools::install_github("jacobbien/litr-project@*release", subdir = "litr")
+
+litr::render("./package/create-FSPmix.Rmd")
+```
+
+
+**Install FSPmix package**
+
+After you deploy the package, you can install it(and all the related packages) in R.
+```{r, eval=FALSE}
+devtools::install('./package//FSPmix')
+```
+
+```{r, message=FALSE, warning=FALSE}
+library(FSPmix)
+library(tidyverse)
+library(patchwork)
+library(ggalluvial)
+```
+
+
+
+
+# Preparing data
+This method is designed for data collecting from mass spectorometer. The ideal data is a pure data matrix and a label list. The label list has two column the first is index of labeled data and the second is their labels. The optional data is data frame with the first n columns are data and the last column is label. Unlabeled data should marked as NA in the last column. With this data frame, you can use prepare_data to process the data. 
+
+The package includes several built-in datasets which are parts of experiment in the paper. You can refer to these datasets and their data type:
+
+- yeast2018
+- hirst2018
+- moloneyTbBSF
+- lopitdcU2OS2018
+- E14TG2aR
+
+**NOTE:** The *Thaps2024* dataset used in this demo is not publicly available at this time. The data will be made available upon journal publication. In the meantime, researchers who wish to access the data may contact Loay J. Jabre(ljabre@mta.ca). 
+```{r}
+# Showing the first line of a built-in dataset
+load("./data/Thaps2024.rda")
+head(setNames(Thaps2024,
+           sub(".*_", "", colnames(Thaps2024))))
+
+# Prepare the data
+x <- prepare_data(Thaps2024)
+data = x$data
+label = x$labels
+
+
+head(label)
+```
+
+
+
+# Fit the model
+The main function in this package is *fspmix*. It will estimate your data with FSPmix model and return a list with the estimated results. **data** and **label** takes the same name attributes of output from *prepare_data* function. **num_clust** and **bandwidth** are two important hyper-parameters which refer to number of cluster and smoothness bandwidth respectively. We will discuss how to choose these two hypers in the following step.
+```{r}
+res <- fspmix(data = data, label = label, 
+              num_clust = 6, bandwidth = 1, 
+              max_iter = 1000, min_gap = 0.1, nrep = 20)
+#check the structure of the output
+str(res)
+```
+
+
+
+# Choosing the hyper-parameters
+## General strategy
+There are two hyper-parameters in FSPmix model. One is number of cluster(usually referred as **K**) and the other is smooth bandwidth(usually referred as **h**). Ideally, without considering computational cost, the optimal approach would involve systematically testing a range of values for both h and K. However, this would consume a significant amount of computational resources. Based on the characteristics of our model, we found a relatively efficient approach: first, set a relatively large value for K (typically 1.5\*K_0 to 2\*K_0, where K_0 is the number of labeled groups), and use this fixed K value to select the optimal h. Then, with the optimal h fixed, gradually search for the optimal K starting from K=K_0.
+
+## Choose the best smooth bandwidth
+To choose the smooth bandwidth **h**, we develop a leave one out cross validation(LOOCV) method. The *cv_fspmix* function will calculate the loss on a grid setting of **h** and identify the best one.
+```{r, eval=FALSE}
+cv_fspmix(data , label , grid = seq(0.1,2.5,0.1), 
+          num_clust = 12 , max_iter = 1000, min_gap = 0.1, nrep = 10)
+```
+
+## Choose the best number of clusters
+To choose the best number of clusters **K**, we refer to Akaike Information Criterion(AIC). This is a criterion based on likelihood and balanced with model complexity using a penalty. The *aic_fspmix* function will calculate the AIC for different setting of K and identify the best one.
+```{r, eval=FALSE}
+aic_fspmix(data , label , max_new_clust = 5, 
+           bandwidth = 1, max_iter = 1000, min_gap = 0.1, nrep = 10)
+```
+
+
+
+# Fit the model with selected hyper-paramters
+```{r}
+res_best <- fspmix(data = data, label = label, 
+              num_clust = 10, bandwidth = 1.5, 
+              max_iter = 1000, min_gap = 0.1, nrep = 20)
+```
+
+
+# Visualize the result in UMAP space
+User can visualize the model prediction result in UMAP space. *visualize_res_UMAP* will map the dataset into a 2-d UMAP space and color the data with predicted labels comparing with annotated labels. 
+```{r, message=FALSE}
+visualize_res_UMAP(data = data, label = label, res = res)
+
+visualize_res_UMAP(data = data, label = label, res = res_best)
+```
+
+
+# Compare the results of the two models.
+User can visualize the prediction difference between two models easily through *comparison_visual* function. This will generate a group-level heatmap and a protein-level alluvial graph.
+```{r}
+comparison_visual(res, res_best)
+```
+
+
+
+
+
+
+# Visualize the high probability bands
+User can construct high probability bands with the model result by specifying alpha levels. *create_hpb* function allow you to visualize the 1-$\alpha$ probability bands for each group. The bands are calculated with Bonferroni correction. You can put your label set as the label attribute to check bands for labeled groups. 
+```{r}
+create_hpb(res, alpha = 0.05,label = label)
+
+create_hpb(res_best, alpha = 0.05,label = label)
+```
+
+

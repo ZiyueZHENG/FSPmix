@@ -1,0 +1,635 @@
+---
+title: "Creating the ``r params$package_name`` R package"
+author: "Ziyue Zheng"
+date: "2025/09/08"
+knit: litr::render
+output: litr::litr_html_document
+params:
+  package_name: "FSPmix"
+  package_parent_dir: "." # <-- relative to this file's location
+---
+
+<!-- This Rmd file contains all the code needed to define an R package.  Press "Knit" in RStudio or more generally run `litr::render("name-of-this-file.Rmd")` to generate the R package.  Remember that when you want to modify anything about the R package, you should modify this document rather than the package that is outputted.
+-->
+
+## Package setup
+
+We start by specifying the information needed in the DESCRIPTION file of the R package.
+
+```{r package-setup, message=FALSE, results='hide'}
+usethis::create_package(
+  path = ".",
+  fields = list(
+    Package = params$package_name,
+    Version = "0.0.0.9000",
+    Title = "A Package That Says Hello",
+    Description = "This package says hello.  But its actual purpose is to show how an R package can be completely coded in a single R markdown file.",
+    `Authors@R` = person(
+      given = "First",
+      family = "Last",
+      email = "you@gmail.com",
+      role = c("aut", "cre")
+      )
+  )
+)
+usethis::use_mit_license(copyright_holder = "F. Last")
+
+
+usethis::use_package("dplyr")
+usethis::use_package("ggplot2")
+usethis::use_package("patchwork")
+usethis::use_package("caret")
+```
+
+## Now to the package itself
+
+### Define a function
+
+Helper function that prepare data and label from a dataframe with label in the last column.
+```{r}
+#' Split a data frame into a data-matrix and indexed label table
+#'
+#' @param df A data.frame with (n + 1) columns:
+#'           the first n are numeric predictors,
+#'           the last column is a (possibly-NA) character/ factor label.
+#' @return   A list with two elements:
+#'           • data   – an n-column numeric matrix  
+#'           • labels – a data.frame with  
+#'               - index  : row numbers of the non-NA labels  
+#'               - label  : integer codes (factor levels) of those labels
+#' @export
+prepare_data <- function(df) {
+  stopifnot(is.data.frame(df), ncol(df) >= 2)
+
+  ## predictors → numeric matrix  (drop = FALSE keeps matrix form for n = 1)
+  X <- as.matrix(df[, -ncol(df), drop = FALSE])
+
+  ## labels  → (index, integer-factor)
+  y        <- df[[ncol(df)]]
+  y[y == "unknown"] <- NA
+  idx      <- which(!is.na(y))           # rows that *have* a label
+  y_factor <- factor(y[idx])             # gives reproducible level ordering
+  y_int    <- as.integer(y_factor)       # integer codes 1, 2, …
+
+  labels <- data.frame(index = idx,
+                       label = y_int)
+
+  ## keep the mapping so you can recover the original text
+  attr(labels$label, "levels") <- levels(y_factor)
+
+  list(data = X,
+       labels = labels)
+}
+
+```
+
+Helper function of row softmax
+```{r}
+#' Row normalized a matrix with sum up to one
+#' @param log_mat
+row_softmax <- function(log_mat) {
+  row_max <- apply(log_mat, 1, max)
+  exp(log_mat - row_max) / rowSums(exp(log_mat - row_max))
+}
+
+```
+
+Gaussian Kernel function
+```{r}
+#' Row normalized a matrix with sum up to one
+#' @param x
+#' @param x_prime
+#' @param sigma
+gaussian_kernel <- function(x, x_prime, sigma = bandwidth) {
+    exp(-((x - x_prime)^2) / (2 * sigma^2))
+}
+```
+
+
+Main function
+```{r}
+#' Main function of semi-supervised functional clustering
+#' 
+#' @param data Data in matrix form(n * p). Can be the data result from prepare_data
+#' @param label Label set. Can be the label result from prepare_data
+#' @param num_clust Number of cluster. If not specified, will equal to number of distinct label
+#' @param bandwidth Smooth bandwidth
+#' @param max_iter Maximum iteration
+#' @param min_gap Minimum difference of likelihood
+#' @param nrep Number of repetitions
+#' @return A list with three elements:
+#'           • data   – an n-column numeric matrix  
+#'           • label – a data.frame with  
+#'               - index  : row numbers of the non-NA labels  
+#'               - label  : integer codes (factor levels) of those labels  
+#' @export
+fspmix <- function(data , label = NULL , num_clust ,
+                               bandwidth = 1, max_iter = 1000 ,
+                               min_gap   = 1 , nrep      = 5) {
+  n  <- nrow(data)
+  p  <- ncol(data)
+  K  <- num_clust
+  data_matrix <- as.matrix(data)
+  
+  ## pre-compute Gaussian kernel over column indices (1:p)
+  t_index <- seq_len(p)
+  kernel_gauss <- exp(-outer(t_index, t_index, "-")^2 / (2 * bandwidth^2)) 
+  
+  ## identity kernel for the variance (0-1 kernel)
+  kernel_id <- diag(p)                          #  p × p
+  
+  likeli_all <- vector("list", nrep)
+  result     <- vector("list", nrep)
+  
+  for (r in seq_len(nrep)) {
+    loglikeli_total <- numeric(max_iter)
+    resp  <- gtools::rdirichlet(n, rep(1, K))     #  n × K
+    pi   <- colSums(resp)/sum(resp)  #  K
+    mu    <- matrix(0,  K, p)                     #  K × p
+    sigma <- matrix(0.1, K, p)                    #  K × p
+    
+    # Initialize the labeled groups
+    if (!is.null(label)) {
+      for (lab in unique(label$label)) {
+        lab = as.numeric(lab)
+        rows <- label[label$label == lab, ]$index
+        inital <- sample(rows, length(rows) * 0.5)
+        mu[lab, ]    <- colMeans(data_matrix[inital, , drop = FALSE])
+        sigma[lab, ] <- apply(data_matrix[inital, , drop = FALSE], 2, function(x) if (length(x) > 1) sd(x) else 0.1) #prevent there is only one sample
+      }
+    }
+    # Initialize the unlabeled groups
+    unfilled <- setdiff(seq_len(K), unique(label$label))
+    for (i in unfilled) {
+      i = as.numeric(i)
+      rand <- sample(setdiff(1:n,label$index),10)
+      mu[i, ]    <- colMeans(data_matrix[rand, , drop = FALSE])
+      sigma[i, ] <- apply(data_matrix[rand, , drop = FALSE], 2, function(x) if (length(x) > 1) sd(x) else 0.1) #prevent there is only one sample
+    }
+    
+    sigma <- pmax(sigma , 0.001) # prevent 0 sigma
+    # Fitting the model
+    for (iter in seq_len(max_iter)) {
+      log_resp <- matrix(0, n, K) 
+      
+      # E step
+      for (k in seq_len(K)) {
+        # n × p matrix of log-densities for component k
+        log_dens_k <- dnorm(data_matrix,
+                            mean = matrix(mu[k, ], nrow = n, ncol = p, byrow = TRUE),
+                            sd   = matrix(sigma[k, ], nrow = n, ncol = p, byrow = TRUE),
+                            log  = TRUE)
+        log_resp[ , k] <- log(pi[k]) + rowSums(log_dens_k)
+      }
+      resp <- row_softmax(log_resp) # n × K
+      
+      if (!is.null(label)) {
+        anchored <- label$index
+        classes  <- label$label
+        resp[anchored, ] <- 0
+        resp[cbind(anchored, classes)] <- 1
+      }
+      
+      # M step
+      pi <- pmax(colMeans(resp), 1e-10) # K, pmax avoid log(0)
+      for (k in seq_len(K)) {
+        w_k   <- resp[ , k]                # n
+        w_sum    <- sum(w_k) + 1e-8  # 1 × p
+        numer_mu <- (t(w_k) %*% data_matrix) %*% kernel_gauss
+        denom    <- w_sum * colSums(kernel_gauss)
+        mu[k, ]  <- numer_mu / pmax(denom, 1e-2)
+      }
+      
+      for (k in seq_len(K)) {
+        centered  <- sweep(data_matrix, 2, mu[k, ], "-")  # n × p
+        numer_sig  <- colSums(resp[ , k] * centered^2)
+        sigma[k, ] <- sqrt(pmax(numer_sig / pmax(colSums(resp)[k], 1e-2), 1e-5))
+      }
+      
+      loglikeli_total[iter] <- sum(rowSums(resp * (log_resp - log(pmax(resp, 1e-10)))))
+
+      if (iter > 1 && abs(loglikeli_total[iter] - loglikeli_total[iter - 1]) < min_gap){
+        break
+      }
+    }
+    
+    likeli_all[[r]] <- loglikeli_total[seq_len(iter)]
+    result[[r]]     <- list(mu = mu, sigma = sigma, pi = pi, resp = resp)
+  }
+  
+  pred <- function(resp){
+  pred_res <- data.frame(t(apply(resp, 1, function(p) {
+    k <- sample.int(length(p), size = 1, prob = p)
+    c(predict_label = k, prob = p[k])})))
+  return(pred_res)
+  }
+  
+  best_time <- which.max(sapply(likeli_all, max, na.rm = TRUE))
+  likeli_trace = likeli_all[[best_time]]
+  
+  list(likeli_trace = likeli_trace,
+       result       = result[[best_time]],
+       likelihood   = max(likeli_trace),
+       data = data,
+       predicted_lab = pred(result[[best_time]]$resp))
+}
+```
+
+
+Prediction function
+```{r}
+#' Make prediction on result$resp
+#' @param resp The n*K memebership matrix generate from fspmix. It is in res$result$resp
+#' @return A dataframe with the first column is predictive label and the second colunm is proability
+#' @export
+prediction <- function(res){
+  pred <- data.frame(t(apply(res$result$resp, 1, function(p) {
+    k <- sample.int(length(p), size = 1, prob = p)
+    c(predict_label = k, prob = p[k])})))
+  return(pred)
+}
+```
+
+
+### Create a dataset
+
+In this case, we'll create the data from scratch.  However, we can also download data from a different source here.
+
+```{r}
+#data <- read.csv("../data/combined_proteindata_loadingnorm_imputed_rownorm_20240617.csv" , row.names = 1)
+#label_data <- read.csv("../data/annotationsforlopit_20240813.csv")
+#full_data <- left_join(tibble::rownames_to_column(data),label_data,by=c("rowname"="protein_id"))
+
+yeast2018 <- read.csv("../../data/yeast2018.csv",row.names = 1)
+hirst2018 <- read.csv("../../data/hirst2018.csv",row.names = 1)
+moloneyTbBSF <- read.csv("../../data/moloneyTbBSF.csv",row.names = 1)
+lopitdcU2OS2018 <- read.csv("../../data/lopitdcU2OS2018.csv",row.names = 1)
+E14TG2aR <- read.csv("../../data/E14TG2aR.csv",row.names = 1)
+
+
+
+```
+
+Now, let's send this off to the package:
+
+```{r}
+usethis::use_data(yeast2018,hirst2018,moloneyTbBSF,lopitdcU2OS2018,E14TG2aR)
+```
+
+And we'll need to document the dataset as well:
+
+
+## Choosing the best hyper-parameters
+### LOOCV choose h_0
+```{r}
+#' Cross validation to choose the best h_0
+#' 
+#' @param data Data in matrix form(n * p). Can be the data result from prepare_data
+#' @param label Label set. Can be the label result from prepare_data
+#' @param grid Grid values of bandwidth h
+#' @param num_clust Number of cluster. If not specified, will equal to number of distinct label
+#' @param bandwidth Smooth bandwidth
+#' @param max_iter Maximum iteration
+#' @param min_gap Minimum difference of likelihood
+#' @param nrep Number of repetitions
+#' @return A list with three elements:
+#'           • all_lost – a list contains all the lost at all grid  
+#'           • average_lost – average lost at all grid  
+#'           • best_h – the best bandwidth
+#' @export
+cv_fspmix <- function(data , label , grid = seq(0.1,2.5,0.1),
+                      num_clust , max_iter = 1000, min_gap = 0.1, nrep = 10){
+  cv_all <- vector("list", length(grid))
+  for(i in 1:length(grid)){
+    h <- grid[i]
+    p <- dim(data)[2]
+  
+    cv <- rep(0,p)
+    for(j in 1:p){
+      res <- fspmix(data[,-j] ,label = label, num_clust = num_clust , bandwidth = h ,max_iter = max_iter , min_gap = min_gap ,nrep = nrep)
+      
+      # mu_hat_(-j)(j)
+      mu_hat <- res$result$mu %*% gaussian_kernel(seq(1,p,1)[-j],j,h) / sum(gaussian_kernel(seq(1,p,1)[-j],j,h))
+      # gamma*y_j
+      mu_tru <- t(res$result$resp) %*% as.matrix(data[,j])/colSums(res$result$resp)
+      # variance
+      sigma_sq_tru <- diag(t(res$result$resp) %*% sweep(matrix(rep(c(data[,j]),8),ncol=8,byrow=FALSE), 2, mu_tru,"-")^2/colSums(res$result$resp))
+      # error
+      cv[j] <- sum((mu_hat-mu_tru)^2/sigma_sq_tru)
+    }
+    cv_all[[i]] <- cv
+  }
+  
+  # a list contain number of grids' vectors. Each vector contain number of channels errors.
+  return(list(all_lost = cv_all ,
+              average_lost = lapply(cv_all,mean),
+              best_h = grid[which.min(lapply(cv_all,mean))]))
+}
+```
+
+### AIC choose K_0
+```{r}
+#' Using AIC to choose the best h_0
+#' 
+#' @param data Data in matrix form(n * p). Can be the data result from prepare_data
+#' @param label Label set. Can be the label result from prepare_data
+#' @param max_new_clust Maximum number of new cluster. Default is 1
+#' @param bandwidth Smooth bandwidth
+#' @param max_iter Maximum iteration
+#' @param min_gap Minimum difference of likelihood
+#' @param nrep Number of repetitions
+#' @export
+aic_fspmix <- function(data , label , max_new_clust = 1, bandwidth = 1,
+                       max_iter = 1000, min_gap = 0.1, nrep = 10){
+  d = dim(data)[2]
+  K = length(unique(label$label))
+  
+  AIC = rep(0 , max_new_clust + 1)
+  
+  res = fspmix(data = data, label = label , num_clust = K,
+                               bandwidth = bandwidth, max_iter = max_iter ,
+                               min_gap   = min_gap , nrep  = nrep)
+  AIC[1] = K * 2 * d - res$likelihood
+  for(i in 1:(max_new_clust)){
+    res = fspmix(data = data, label = label , num_clust = K + i ,
+                               bandwidth = bandwidth, max_iter = max_iter ,
+                               min_gap   = min_gap , nrep  = nrep)
+    AIC[i+1] = (i + K) * 2 * d - res$likelihood
+  }
+  
+  return(list(AIC = AIC,
+              best_K0 = which.min(AIC) - 1))
+}
+```
+
+
+## Visualization
+### UMAP result
+```{r}
+#' Prediction result in UMAP space 
+#' 
+#' @param data Data
+#' @param label Label
+#' @param prediction Generate from prediction function 
+#' @export
+visualize_res_UMAP <- function(data,label,res){
+  pred <- prediction(res)
+  
+  d.umap <- umap::umap(data,n_neighbors = 500, min_dist = 0.05, 
+                 verbose = T, n_epochs = 1000, n_components=2)
+  scores <- data.frame(d.umap$layout)
+  
+  colnames(scores) <- c("x1","x2")
+  data = data %>% 
+    cbind(scores) %>%
+    cbind(pred)
+  
+  new_group <- paste0( "New", seq_len( length(unique(pred$predict_label)) - length(unique(label[,2])) ) ) 
+  levels <- c(attr(label$label, "levels"), new_group)
+  
+  p1 <- data %>% ggplot() +
+  geom_point(data = data[-label[,1],], # unlabeled
+             aes(x = x1, y = x2), size=1, alpha = 0.1) +
+  geom_point(data = data[label[,1],], # labeled
+             aes(x = x1, y = x2, col = levels[label[,2]] ), size=1.5, alpha = 0.8) +
+  theme_classic() +
+  theme(legend.title = element_blank(),
+        plot.subtitle = element_text(hjust = 0.5),
+        panel.grid.major = element_line(color = "gray88", size = 0.2)
+        ) +
+  labs(subtitle = "Annotated data set")
+  
+  p2 <- data %>% 
+  ggplot() +
+  geom_point(aes(x = x1, y = x2, col = levels[predict_label], size = prob) , alpha = .8) +
+  scale_size(range = c(0.01, 1.5)) +
+  labs(color = "", size = "Probability") +
+  theme_classic() +
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        legend.spacing.y = unit(0.05, 'cm'),
+        legend.margin = margin(0, 0, 0, 0),
+        panel.grid.major = element_line(color = "gray88", size = 0.2)
+        ) +
+  labs(subtitle = "Predictive groups")
+  
+  p1 / p2
+}
+```
+
+
+### Membership visualization
+```{r}
+#' Draw membership heatmap
+#' 
+#' @param res Output of fspmix function
+#' @export
+draw_heatmap <- function(res){
+  mat <- res$result$resp
+  pred <- prediction(res)
+  
+  heat_df <- mat %>%                            
+    as.data.frame() %>%
+    rownames_to_column(var = "id") %>%        
+    mutate(label = pred$predict_label) %>%          
+    pivot_longer(       
+      cols      = -c(id, label),  
+      names_to  = "fraction",
+      values_to = "probability"
+    ) %>% 
+    arrange(label) %>% 
+    mutate(
+      id       = factor(id,       levels = rev(unique(id))), 
+      fraction = factor(fraction, levels = unique(fraction)),
+      label = factor(label)
+    )
+  
+  
+  ggplot(heat_df, aes(x = fraction, y = id, fill = probability)) +
+    geom_tile() +
+    scale_fill_gradient(low = "white", high = "blue") +
+    ggnewscale::new_scale_fill() +  
+    geom_tile(aes(x = 0, fill = factor(label)), width = 0.25) +
+    theme_minimal() +
+    theme(axis.title      = element_blank(),
+          axis.text.x     = element_text(angle = 45, hjust = 1),
+          axis.text.y     = element_blank(),  
+          axis.ticks.y    = element_blank(),
+          panel.grid      = element_blank())
+}
+
+```
+
+
+### Results comparison(heatmap and alluvial plot)
+```{r}
+#' Model results comparison
+#' 
+#' @param res1 Output of fspmix function
+#' @param res2 Output of fspmix function
+#' @export
+comparison_visual <- function(res1 , res2){
+  pred1 = prediction(res1)
+  pred2 = prediction(res2)
+  
+  # make contingency table
+  make_contingency_table<-function(mem1, mem2){
+    tab = table(mem1, mem2)
+    tab = cbind(tab, rowSums(tab))
+    tab = rbind(tab, colSums(tab))
+    return(tab)
+  }
+  
+  tab = make_contingency_table(pred1$predict_label, pred2$predict_label)
+  tab_clean <- tab[1:(nrow(tab) - 1), 1:(ncol(tab) - 1)]
+  rtab_clean = tab_clean / rowSums(tab_clean)
+  
+  rtab_long <- as.data.frame(rtab_clean) %>%
+    mutate(from = rownames(rtab_clean)) %>%
+    pivot_longer(cols = -from, names_to = "to", values_to = "value") %>%
+    mutate(to = factor(.$to, levels = colnames(tab_clean)))
+  
+  # Heatmap
+  heatmap <- ggplot(rtab_long, aes(x = to, y = from, fill = value)) +
+    geom_tile(color = "lightgrey") +
+    geom_text(aes(label = paste0(round(value * 100, 1), "%")), color = "black", size = 3) +
+    scale_fill_gradient(limits = c(0, 1), low = grey(0.98), high = "blue") +
+    labs(
+      x = "Model 1",
+      y = "Model 2",
+      title = "Similarity matrix of two model prediction"
+    )+
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5,size = 14,face = "bold"),
+          axis.text.x = element_text(angle = 25, vjust = 1,hjust = 1),
+          plot.margin = margin(t = 5, r = 5, b = 5, l = 5),
+          legend.title = element_text(face = "bold"))
+  
+  # Convert to counts of flows
+  df_counts <- as.data.frame(table(pred1$predict_label, pred2$predict_label))
+  colnames(df_counts) <- c("Model_1", "Model_2", "Freq")
+  
+  # Alluvial plot
+  alluvia <- ggplot(df_counts,
+         aes(axis1 = Model_1, axis2 = Model_2, y = Freq)) +
+    geom_alluvium(aes(fill = Model_2),  width = 1/12) +
+    geom_stratum(width = 1/12, aes(fill = after_stat(stratum)), color = "black") +
+    geom_text(stat = "stratum",
+              aes(label = after_stat(stratum)),
+              size = 5) +
+    scale_x_discrete(limits = c("Model 1", "Model 2"), expand = c(.1, .1)) +
+    theme_minimal() +
+    labs(y = "Count", title = "Prediction differences between two models") +
+    theme(legend.position = "none",
+          plot.title = element_text(hjust = 0.5,size = 14, face = "bold"),
+          axis.text = element_text(size = 11))
+  
+  alluvia/heatmap + 
+    plot_layout(heights = c(3,2))
+}
+
+```
+
+
+### Create high probability bands
+```{r}
+#' Draw high probability bands
+#' 
+#' @param res Output from fspmix
+#' @param alpha Alpha level, default is 0.05
+#' @param label Label set, used to assign graph titles. If empty, titles will be automatically given Group 1 to K
+#' 
+#' @export
+create_hpb <- function(res, alpha = 0.05,label = NULL){
+  K <- nrow(res$result$mu)
+  p <- ncol(res$result$mu)
+  
+  auto_mfrow <- function(n) {
+    nr <- floor(sqrt(n))
+    nc <- ceiling(n / nr)
+    c(nr, nc)
+  }
+  par(mfrow = auto_mfrow(K))
+  
+  if(!is.null(label)){
+    group <- attr(label$label,"levels")
+    if(K>length(group)){
+      group <- c(group,paste0("New", 1: (K - length(group))))
+    }
+  }else{
+    group <- paste0("Group",1:K)
+  }
+  
+  pred = prediction(res)
+  bands = array(dim = c(2 , p , K))
+  for(k in 1:K){
+    x = res$data[which(pred$predict_label == k),]
+    for(d in 1:p){
+      h = res$result$sigma[k,d] * length(x[,d])^(-0.2)
+      pad = 10*h
+      rng = apply(x, 2, range)
+      probs = c( (alpha/p)/2 , 1 - (alpha/p)/2 )
+      interval <- matrix(c(rng[1,] - pad , rng[2,] + pad) , nrow = 2, byrow = TRUE)
+      
+      Fhat <- function(z) mean(pnorm((z - x[,d]) / h))
+      qfun <- function(p) uniroot(function(z) Fhat(z) - p, interval = interval[,d])$root
+      bands[,d,k] <- vapply(probs, qfun, numeric(1))
+    }
+  }
+  
+  for(i in 1:K){
+    mean_line <- res$result$mu[i,]
+    x <- seq(1,p)
+    plot(x, t(mean_line), type = "l", ylim = c(0,1),lty = 1, lwd = 2, pch = 20, col = i, xlab = "", ylab = "",main = group[i])
+    upper <- bands[2,,i]
+    lower <- bands[1,,i]
+    polygon(c(x, rev(x)), c(upper, rev(lower)), col = adjustcolor(i, alpha.f = 0.2), border = NA)
+    if(i %in% label$label){
+      for (j in which(label$label == i)) {
+        lines(res$data[label[j,]$index,] , col = i)
+      }
+    }
+  }
+}
+```
+
+
+
+
+
+## Documenting the package and building
+
+We finish by running commands that will document, build, and install the package.  It may also be a good idea to check the package from within this file.
+
+```{r}
+litr::document() # <-- use instead of devtools::document()
+devtools::build()
+#devtools::install()
+#devtools::check(document = FALSE)
+```
+
+
+### Add a README
+
+Our README.Rmd lives in the `source-files` directory.  As described [here](https://pkgdown.r-lib.org/reference/build_home.html#package-logo), if we have a hex sticker, we'll add something like the following to the level-one header at the top of the README:
+
+```
+# withpkgdown: An Example Package <img src="man/figures/logo.png" align="right" height="139" />
+```
+
+We add `README.Rmd` to the package and then generate the `README.md` based on it:
+
+```{r}
+#litr::add_readme("../source-files/README.Rmd")
+```
+
+
+### Add a vignette
+
+```{r}
+#litr::add_vignettes("../source-files/using-package.Rmd")
+```
+
+
+
+
+
